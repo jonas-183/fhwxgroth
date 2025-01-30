@@ -31,7 +31,7 @@ class ResidualBlock(torch.nn.Module):
         return self.relu(x + residual)
 
 # U-Net
-class UNet(torch.nn.Module):
+class UNet(torch.nn.Module): # ist nicht gut
     def __init__(self, num_classes=4):
         super(UNet, self).__init__()
         self.encoder = torch.nn.Sequential(
@@ -49,26 +49,42 @@ class UNet(torch.nn.Module):
         x = self.decoder(x)
         return x
 
-class DeepUNet(nn.Module):
+class AttentionGate(nn.Module):
+    def __init__(self, in_channels, gating_channels):
+        super(AttentionGate, self).__init__()
+        self.conv_gate = nn.Conv2d(gating_channels, in_channels, kernel_size=1)
+        self.conv_input = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv_attention = nn.Conv2d(in_channels, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, g):
+        gate = self.conv_gate(g)
+        inputs = self.conv_input(x)
+        attention = self.relu(gate + inputs)
+        attention = self.sigmoid(self.conv_attention(attention))
+        return x * attention
+
+class DeepUNet(nn.Module): # ist bisher das beste
     def __init__(self, num_classes=4):
         super(DeepUNet, self).__init__()
-
         # Encoder
-        self.enc1 = self.conv_block(3, 64)  # Eingabekanal auf 3 setzen
+        self.enc1 = self.conv_block(3, 64)
         self.enc2 = self.conv_block(64, 128)
         self.enc3 = self.conv_block(128, 256)
         self.enc4 = self.conv_block(256, 512)
-        self.enc5 = self.conv_block(512, 1024)  # Tieferer Encoder
+        self.enc5 = self.conv_block(512, 1024)
 
-        # Decoder
+        # Decoder with Attention Gates
+        self.attention5 = AttentionGate(512, 1024)
         self.upconv5 = self.upconv_block(1024, 512)
+        self.attention4 = AttentionGate(256, 512)
         self.upconv4 = self.upconv_block(512, 256)
+        self.attention3 = AttentionGate(128, 256)
         self.upconv3 = self.upconv_block(256, 128)
+        self.attention2 = AttentionGate(64, 128)
         self.upconv2 = self.upconv_block(128, 64)
         self.upconv1 = self.upconv_block(64, num_classes, final=True)
-
-        # Bottleneck
-        self.bottleneck = nn.Conv2d(1024, 1024, kernel_size=1)
 
     def conv_block(self, in_channels, out_channels):
         """Hilfsfunktion für Convolutional Blocks"""
@@ -99,20 +115,17 @@ class DeepUNet(nn.Module):
         enc4 = self.enc4(enc3)
         enc5 = self.enc5(enc4)
 
-        # Bottleneck
-        bottleneck = self.bottleneck(enc5)
-
-        # Decoder
-        dec5 = self.upconv5(bottleneck)
-        dec4 = self.upconv4(dec5 + enc4)  # Skip Connection
-        dec3 = self.upconv3(dec4 + enc3)  # Skip Connection
-        dec2 = self.upconv2(dec3 + enc2)  # Skip Connection
-        dec1 = self.upconv1(dec2 + enc1)  # Skip Connection
+        # Decoder with Attention
+        dec5 = self.upconv5(self.attention5(enc4, enc5))
+        dec4 = self.upconv4(self.attention4(enc3, dec5))
+        dec3 = self.upconv3(self.attention3(enc2, dec4))
+        dec2 = self.upconv2(self.attention2(enc1, dec3))
+        dec1 = self.upconv1(dec2)
 
         return dec1
 
 
-class DeeperUNet(nn.Module):
+class DeeperUNet(nn.Module): # ist auch schlecht
     def __init__(self, num_classes=4):
         super(DeeperUNet, self).__init__()
 

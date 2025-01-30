@@ -4,9 +4,9 @@ import torch
 TRAIN_FILE = "data/train.txt"
 VAL_FILE = "data/val.txt"
 BASE_PATH = "data/cubicasa5k"
-BATCH_SIZE = 48
+BATCH_SIZE = 16
 NUM_CLASSES = 4
-EPOCHS = 15
+EPOCHS = 40
 LEARNING_RATE = 1e-3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
