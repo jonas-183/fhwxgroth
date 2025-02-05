@@ -3,8 +3,8 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torch import nn
-from models.unet import UNet, DeepUNet, DeeperUNet
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from models.unet import DeepUNet
 from utils.svg_utils import FloorPlanDataset, load_file_list
 from utils.save_output import save_as_svg
 import matplotlib.pyplot as plt
@@ -15,17 +15,17 @@ train_list = load_file_list(TRAIN_FILE)
 val_list = load_file_list(VAL_FILE)
 
 train_transform = transforms.Compose([
-    transforms.Resize((512, 512)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(degrees=10),
-    transforms.RandomResizedCrop(512, scale=(0.8, 1.0)),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.Resize((256, 256)),
+    transforms.RandomHorizontalFlip(p=0.5),  # 50% Wahrscheinlichkeit für horizontales Spiegeln
+    transforms.RandomRotation(degrees=10),  # Zufällige Rotation um bis zu 10°
+    transforms.RandomAffine(degrees=0, shear=10),  # Zufälliges Scheren
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),  # Helligkeit/Kontrast zufällig variieren
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Normalisierung
 ])
 
 val_transform = transforms.Compose([
-    transforms.Resize((512, 512), interpolation=transforms.InterpolationMode.NEAREST),
+    transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.NEAREST),
     transforms.ToTensor()
 ])
 
@@ -35,43 +35,52 @@ val_dataset = FloorPlanDataset(val_list, BASE_PATH, transform=val_transform)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-def boundary_loss(outputs, targets):
-    """
-    Berechnet den Boundary Loss, um die Genauigkeit der Kanten zu verbessern.
-    :param outputs: Vorhersagen des Modells (Tensor der Form [Batch, Klassen, Höhe, Breite]).
-    :param targets: Ground-Truth-Labels (Tensor der Form [Batch, Höhe, Breite]).
-    :return: Boundary Loss (Skalar).
-    """
-    # Gradienten der Vorhersagen und Labels berechnen
-    outputs_grad = torch.abs(torch.gradient(outputs, dim=(2, 3)))  # Gradient entlang Höhe und Breite
-    targets_grad = torch.abs(torch.gradient(targets.float(), dim=(2, 3)))
+def calculate_class_weights(dataset):
+    class_counts = np.zeros(NUM_CLASSES)  # Anzahl der Pixel pro Klasse
+    total_pixels = 0  # Gesamtanzahl der Pixel
 
-    # Mittlere absolute Differenz der Gradienten
-    loss = torch.mean(torch.abs(outputs_grad - targets_grad))
-    return loss
-class CombinedLoss(nn.Module):
+    for _, labels in dataset:
+        for class_id in range(NUM_CLASSES):
+            class_counts[class_id] += (labels == class_id).sum().item()
+        total_pixels += labels.numel()
+
+    class_weights = total_pixels / (NUM_CLASSES * class_counts)
+    return torch.tensor(class_weights, dtype=torch.float32)
+
+
+class CombinedLoss(torch.nn.Module):
     def __init__(self, class_weights=None):
         super(CombinedLoss, self).__init__()
-        self.cross_entropy = nn.CrossEntropyLoss(weight=class_weights)
+        self.cross_entropy = torch.nn.CrossEntropyLoss(weight=class_weights)
+        self.class_weights = class_weights
 
     def forward(self, outputs, targets):
         ce_loss = self.cross_entropy(outputs, targets)
+
+        # Gewichteter Dice Loss
         smooth = 1.0
         outputs = torch.softmax(outputs, dim=1)
         targets_one_hot = torch.nn.functional.one_hot(targets, num_classes=outputs.shape[1]).permute(0, 3, 1, 2).float()
+
         intersection = (outputs * targets_one_hot).sum(dim=(2, 3))
-        dice_loss = 1 - (2.0 * intersection + smooth) / (outputs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3)) + smooth)
-        bd_loss = boundary_loss(outputs, targets)  # Boundary Loss hinzufügen
-        return ce_loss + dice_loss.mean() + bd_loss
+        dice_loss = 1 - (2.0 * intersection + smooth) / (
+                    outputs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3)) + smooth)
+
+        if self.class_weights is not None:
+            dice_loss = dice_loss * self.class_weights.view(1, -1)  # Gewichte anwenden
+
+        return ce_loss + dice_loss.mean()
 
 # Modell und Training
-#model = UNet(num_classes=NUM_CLASSES).to(DEVICE)
+#class_weights = calculate_class_weights(train_dataset)
+#print(class_weights)
+class_weights = torch.tensor([ 0.2836,  2.7955, 25.4555, 13.0407], dtype=torch.float32) # eingesetzte Werte kamen bei erster Berechnung mit calculate_class_weights heraus
+class_weights = class_weights.to(DEVICE)
+print(DEVICE)
 model = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
-#model = DeeperUNet(num_classes=NUM_CLASSES).to(DEVICE)
-class_weights = torch.tensor([1.0, 3.5, 14.0, 14.0], device=DEVICE)  # Adjust based on your dataset
 criterion = CombinedLoss(class_weights=class_weights)
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
 
 # Parameter für Early Stopping
 patience = 5  # Anzahl der Epochen ohne Verbesserung
@@ -125,43 +134,38 @@ for epoch in range(EPOCHS):
         if counter >= patience:
             print("Early stopping triggered. Training stopped.")
             break
-    scheduler.step()
+
+    scheduler.step(val_loss)  # Lernrate anpassen basierend auf Validierungsverlust
 
 # Modell nach Training speichern (falls nicht gestoppt)
 if counter < patience:
-    torch.save(model.state_dict(), "model_weights_2.pth")
+    torch.save(model.state_dict(), "model_weights_1.pth")
 
-# Validierung und SVG-Erstellung (ein Beispiel)
+# Pre Processing
+
+#smoothed_preds =
+# Validierung
 model.eval()
+# Anzeigen des Inputs und der Prediction
+index_for_predcition = 0
 with torch.no_grad():
     for imgs, labels in val_loader:
         imgs = imgs.to(DEVICE)
         outputs = model(imgs)
         preds = torch.argmax(outputs, dim=1)
 
-        preds = preds.cpu().numpy()  # Convert predictions to numpy
-        cleaned_mask = np.zeros_like(preds)
-
-        # for i in range(preds.shape[0]):  # Loop over batch
-        #     mask = preds[i].astype(np.uint8)
-        #     kernel = np.ones((3, 3), np.uint8)
-        #     cleaned_mask[i] = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        #     cleaned_mask[i] = cv2.morphologyEx(cleaned_mask[i], cv2.MORPH_CLOSE, kernel)
-        #
-        # np.savetxt("mask_1", cleaned_mask, ",")
-
-        plt.figure(figsize=(13, 5))
-        plt.subplot(1, 3, 1)
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 4, 1)
         plt.title("Input")
-        plt.imshow(imgs[0].cpu().permute(1, 2, 0))  # RGB-Darstellung
-        plt.subplot(1, 3, 2)
+        plt.imshow(imgs[index_for_predcition].cpu().permute(1, 2, 0))  # RGB-Darstellung
+        plt.subplot(1, 4, 2)
         plt.title("Label")
-        plt.imshow(labels[0].cpu(), cmap='gray')  # Ground Truth
-        plt.subplot(1, 3, 3)
+        plt.imshow(labels[index_for_predcition].cpu(), cmap='gray')  # Ground Truth
+        plt.subplot(1, 4, 3)
         plt.title("Prediction")
-        plt.imshow(preds[0].cpu(), cmap='gray')  # Modellvorhersage
-        # plt.subplot(1, 3, 4)
-        # plt.title("Gecleante Prediction")
-        # plt.imshow(cleaned_mask[0], cmap='gray')
+        plt.imshow(preds[index_for_predcition].cpu(), cmap='gray')  # Modellvorhersage
+        plt.subplot(1, 4, 4)
+        plt.title("Smoothed Prediction")
+        plt.imshow(smoothed_preds[index_for_predcition].cpu(), cmap='gray')  # Modellvorhersage
         plt.show()
         break
