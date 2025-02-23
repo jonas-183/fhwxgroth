@@ -1,72 +1,99 @@
+import torch.nn as nn
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from models.unet import UNet, DeepUNet, DeeperUNet
+from models.unet import DeepUNet
 from utils.svg_utils import FloorPlanDataset, load_file_list
-from utils.save_output import save_as_svg
-import matplotlib.pyplot as plt
 from config import *
 
+# Focal Loss für unbalancierte Daten
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2., alpha=0.25):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, outputs, target):
+        CE_loss = nn.CrossEntropyLoss(reduction='none')(outputs, target)
+        pt = torch.exp(-CE_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * CE_loss
+        return focal_loss.mean()
+
+# Ensemble-Modell (2 Modelle)
+class EnsembleModel(nn.Module):
+    def __init__(self, model1, model2):
+        super(EnsembleModel, self).__init__()
+        self.model1 = model1
+        self.model2 = model2
+
+    def forward(self, x):
+        out1 = self.model1(x)
+        out2 = self.model2(x)
+        softmax1 = torch.softmax(out1, dim=1)
+        softmax2 = torch.softmax(out2, dim=1)
+        return (softmax1 + softmax2) / 2  # Durchschnitt der Vorhersagen
+
+# Lese Datei-Liste ein
 val_list = load_file_list(VAL_FILE)
 
+# Datenvorverarbeitung
 val_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
+    transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.BILINEAR),
     transforms.ToTensor()
 ])
 
 val_dataset = FloorPlanDataset(val_list, BASE_PATH, transform=val_transform)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE,shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-# Modellinitialisierung
-model = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
+# Original-Modell initialisieren
+model_single = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
+model_single.load_state_dict(torch.load('model_weights_4.pth', map_location=DEVICE, weights_only = True))
 
-model.load_state_dict(torch.load('model_weights_4.pth', map_location=torch.device('cpu'), weights_only=True))
+# Ensemble-Modelle initialisieren
+model1 = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
+model2 = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
 
-model.eval()
+# Ensemble-Modell erstellen
+ensemble_model = EnsembleModel(model1, model2).to(DEVICE)
 
-# Metrik-Initialisierung
-correct_pixels = 0
-total_pixels = 0
-correct_per_class = {classname: 0 for classname in range(NUM_CLASSES)}  # Klassenweise
-total_per_class = {classname: 0 for classname in range(NUM_CLASSES)}  # Pixelanzahl pro Klasse
+# Modelle in den Evaluierungsmodus setzen
+model_single.eval()
+ensemble_model.eval()
 
+# Focal Loss als Verlustfunktion
+criterion = FocalLoss(gamma=2., alpha=0.25)
+
+# Schleife über das Validierungs-Dataset
 with torch.no_grad():
     for imgs, labels in val_loader:
         imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
 
-        # Modellvorhersagen
-        outputs = model(imgs)
-        preds = torch.argmax(outputs, dim=1)
+        # Vorhersage mit dem Einzelmodell
+        outputs_single = model_single(imgs)
+        preds_single = torch.argmax(outputs_single, dim=1).cpu().numpy()
 
-        # Pixelgenauigkeit berechnen
-        correct_pixels += (preds == labels).sum().item()
-        total_pixels += torch.numel(labels)
+        # Vorhersage mit dem Ensemble-Modell
+        outputs_ensemble = ensemble_model(imgs)
+        preds_ensemble = torch.argmax(outputs_ensemble, dim=1).cpu().numpy()
 
-        # Klassenweise Genauigkeit berechnen
-        for label, prediction in zip(labels.view(-1), preds.view(-1)):  # Pixelweise
-            total_per_class[label.item()] += 1
-            if label == prediction:
-                correct_per_class[label.item()] += 1
+        # Visualisierung der Eingabe und der Vorhersagen
+        plt.figure(figsize=(20, 6))
 
-        # Beispielvisualisierung (optional)
-        plt.figure(figsize=(10, 5))
         plt.subplot(1, 3, 1)
-        plt.title("Input")
-        plt.imshow(imgs[4].cpu().permute(1, 2, 0))  # RGB-Darstellung
+        plt.title("Input Image")
+        plt.imshow(imgs[0].cpu().permute(1, 2, 0))
+        plt.axis('off')
+
         plt.subplot(1, 3, 2)
-        plt.title("Label")
-        plt.imshow(labels[4].cpu(), cmap='gray')  # Ground Truth
+        plt.title("Original Prediction (Single Model)")
+        plt.imshow(preds_single[0], cmap='gray')
+        plt.axis('off')
+
         plt.subplot(1, 3, 3)
-        plt.title("Prediction")
-        plt.imshow(preds[4].cpu(), cmap='gray')  # Modellvorhersage
+        plt.title("Ensemble Prediction")
+        plt.imshow(preds_ensemble[0], cmap='gray')
+        plt.axis('off')
+
+        plt.tight_layout()
         plt.show()
-        break  # Nur die erste Batch visualisieren
-
-# Gesamtaccuracy berechnen
-overall_accuracy = 100 * correct_pixels / total_pixels
-print(f'Overall Pixel Accuracy: {overall_accuracy:.2f} %')
-
-# Klassenweise Genauigkeit berechnen
-for classname, correct_count in correct_per_class.items():
-    if total_per_class[classname] > 0:  # Vermeidung von Division durch 0
-        class_accuracy = 100 * float(correct_count) / total_per_class[classname]
-        print(f'Accuracy for class {classname} is {class_accuracy:.1f} %')
+        break
