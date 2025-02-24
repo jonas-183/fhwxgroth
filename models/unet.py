@@ -30,15 +30,16 @@ class AttentionGate(nn.Module):
 class DeepUNet(nn.Module):
     def __init__(self, num_classes=4):
         super(DeepUNet, self).__init__()
-
+        self.dropout = nn.Dropout2d(0.3)
+        
         # Encoder
-        self.enc1 = self.conv_block(3, 64)  # Eingabekanal auf 3 setzen
-        self.enc2 = self.conv_block(64, 128)
-        self.enc3 = self.conv_block(128, 256)
-        self.enc4 = self.conv_block(256, 512)
-        self.enc5 = self.conv_block(512, 1024)  # Tieferer Encoder
-        self.enc6 = self.conv_block(1024, 2048)
-
+        self.enc1 = self._make_encoder_block(3, 64)
+        self.enc2 = self._make_encoder_block(64, 128)
+        self.enc3 = self._make_encoder_block(128, 256)
+        self.enc4 = self._make_encoder_block(256, 512)
+        self.enc5 = self._make_encoder_block(512, 1024)
+        self.enc6 = self._make_encoder_block(1024, 2048)
+        
         # Decoder
         self.upconv6 = self.upconv_block(2048, 1024)
         self.upconv5 = self.upconv_block(1024, 512)
@@ -57,7 +58,6 @@ class DeepUNet(nn.Module):
         self.attention2 = AttentionGate(F_g=128, F_l=128, F_int=64)
         self.attention1 = AttentionGate(F_g=64, F_l=64, F_int=32)
 
-
         # Bottleneck
         self.bottleneck = nn.Conv2d(2048, 2048, kernel_size=1)
         # Initialize weights
@@ -69,23 +69,8 @@ class DeepUNet(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    # def conv_block(self, in_channels, out_channels):
-    #     """Helper function for convolutional blocks with residual connection"""
-    #     return nn.Sequential(
-    #         nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-    #         nn.InstanceNorm2d(out_channels),
-    #         nn.LeakyReLU(negative_slope=0.2, inplace=True),
-    #         nn.Dropout2d(0.2),
-    #         nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-    #         nn.InstanceNorm2d(out_channels),
-    #         nn.LeakyReLU(negative_slope=0.2, inplace=True),
-    #         nn.Dropout2d(0.2),
-    #         nn.MaxPool2d(kernel_size=2, stride=2)
-    #     )
-
-    def conv_block(self, in_channels, out_channels):
+    def _make_encoder_block(self, in_channels, out_channels):
         """Convolutional block with residual connection"""
-
         class ResBlock(nn.Module):
             def __init__(self, in_ch, out_ch):
                 super().__init__()
@@ -95,29 +80,41 @@ class DeepUNet(nn.Module):
                 self.norm2 = nn.InstanceNorm2d(out_ch)
                 self.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
                 self.dropout = nn.Dropout2d(0.2)
-                # Residual connection adjustment if channels don't match
                 self.downsample = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
             def forward(self, x):
                 identity = self.downsample(x)
-
                 out = self.conv1(x)
                 out = self.norm1(out)
                 out = self.relu(out)
                 out = self.dropout(out)
-
                 out = self.conv2(out)
                 out = self.norm2(out)
-
-                # Add residual connection
                 out += identity
                 out = self.relu(out)
-
                 return out
+
+        class SEBlock(nn.Module):
+            def __init__(self, channel, reduction=16):
+                super().__init__()
+                self.avg_pool = nn.AdaptiveAvgPool2d(1)
+                self.fc = nn.Sequential(
+                    nn.Linear(channel, channel // reduction, bias=False),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(channel // reduction, channel, bias=False),
+                    nn.Sigmoid()
+                )
+
+            def forward(self, x):
+                b, c, _, _ = x.size()
+                y = self.avg_pool(x).view(b, c)
+                y = self.fc(y).view(b, c, 1, 1)
+                return x * y.expand_as(x)
 
         return nn.Sequential(
             ResBlock(in_channels, out_channels),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            SEBlock(out_channels),
+            self.dropout
         )
 
     def upconv_block(self, in_channels, out_channels, final=False):

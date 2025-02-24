@@ -16,12 +16,18 @@ val_list = load_file_list(VAL_FILE)
 
 train_transform = transforms.Compose([
     transforms.Resize((256, 256)),
-    transforms.RandomHorizontalFlip(p=0.5),  # 50% Wahrscheinlichkeit für horizontales Spiegeln
-    transforms.RandomRotation(degrees=10),  # Zufällige Rotation um bis zu 10°
-    transforms.RandomAffine(degrees=0, shear=10),  # Zufälliges Scheren
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),  # Helligkeit/Kontrast zufällig variieren
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.3),  # Vertikales Spiegeln hinzufügen
+    transforms.RandomRotation(degrees=15),  # Rotationswinkel erhöhen
+    transforms.RandomAffine(
+        degrees=0, 
+        translate=(0.1, 0.1),  # Translation hinzufügen
+        scale=(0.9, 1.1),      # Skalierung hinzufügen
+        shear=10
+    ),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Normalisierung
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet Statistiken
 ])
 
 val_transform = transforms.Compose([
@@ -53,23 +59,27 @@ class CombinedLoss(torch.nn.Module):
         super(CombinedLoss, self).__init__()
         self.cross_entropy = torch.nn.CrossEntropyLoss(weight=class_weights)
         self.class_weights = class_weights
+        self.focal_gamma = 2.0  # Focal Loss Parameter
 
     def forward(self, outputs, targets):
+        # Focal Loss
         ce_loss = self.cross_entropy(outputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.focal_gamma) * ce_loss
 
-        # Gewichteter Dice Loss
+        # Dice Loss wie zuvor
         smooth = 1.0
         outputs = torch.softmax(outputs, dim=1)
         targets_one_hot = torch.nn.functional.one_hot(targets, num_classes=outputs.shape[1]).permute(0, 3, 1, 2).float()
-
+        
         intersection = (outputs * targets_one_hot).sum(dim=(2, 3))
         dice_loss = 1 - (2.0 * intersection + smooth) / (
                     outputs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3)) + smooth)
 
         if self.class_weights is not None:
-            dice_loss = dice_loss * self.class_weights.view(1, -1)  # Gewichte anwenden
+            dice_loss = dice_loss * self.class_weights.view(1, -1)
 
-        return ce_loss + dice_loss.mean()
+        return focal_loss + dice_loss.mean()
 
 # Modell und Training
 #class_weights = calculate_class_weights(train_dataset)
@@ -79,8 +89,12 @@ class_weights = class_weights.to(DEVICE)
 print(DEVICE)
 model = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
 criterion = CombinedLoss(class_weights=class_weights)
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer, 
+    T_0=10,  # Restart alle 10 Epochen
+    T_mult=2  # Verdoppelt das Restart-Intervall nach jedem Restart
+)
 
 # Parameter für Early Stopping
 patience = 5  # Anzahl der Epochen ohne Verbesserung
@@ -135,7 +149,7 @@ for epoch in range(EPOCHS):
             print("Early stopping triggered. Training stopped.")
             break
 
-    scheduler.step(val_loss)  # Lernrate anpassen basierend auf Validierungsverlust
+    scheduler.step()  # Lernrate anpassen basierend auf Validierungsverlust
 
 # Modell nach Training speichern (falls nicht gestoppt)
 if counter < patience:
@@ -155,17 +169,14 @@ with torch.no_grad():
         preds = torch.argmax(outputs, dim=1)
 
         plt.figure(figsize=(10, 5))
-        plt.subplot(1, 4, 1)
+        plt.subplot(1, 3, 1)
         plt.title("Input")
         plt.imshow(imgs[index_for_predcition].cpu().permute(1, 2, 0))  # RGB-Darstellung
-        plt.subplot(1, 4, 2)
+        plt.subplot(1, 3, 2)
         plt.title("Label")
         plt.imshow(labels[index_for_predcition].cpu(), cmap='gray')  # Ground Truth
-        plt.subplot(1, 4, 3)
+        plt.subplot(1, 3, 3)
         plt.title("Prediction")
         plt.imshow(preds[index_for_predcition].cpu(), cmap='gray')  # Modellvorhersage
-        plt.subplot(1, 4, 4)
-        plt.title("Smoothed Prediction")
-        plt.imshow(smoothed_preds[index_for_predcition].cpu(), cmap='gray')  # Modellvorhersage
         plt.show()
         break

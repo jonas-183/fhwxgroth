@@ -1,6 +1,6 @@
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from models.unet import UNet, DeepUNet, DeeperUNet
+from models.unet import DeepUNet
 from utils.svg_utils import FloorPlanDataset, load_file_list
 from utils.save_output import save_as_svg
 import matplotlib.pyplot as plt
@@ -19,7 +19,7 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE,shuffle=True)
 # Modellinitialisierung
 model = DeepUNet(num_classes=NUM_CLASSES).to(DEVICE)
 
-model.load_state_dict(torch.load('model_weights_4.pth', map_location=torch.device('cpu'), weights_only=True))
+model.load_state_dict(torch.load('best_model_weights_3.pth', map_location=torch.device('cpu'), weights_only=True))
 
 model.eval()
 
@@ -29,44 +29,62 @@ total_pixels = 0
 correct_per_class = {classname: 0 for classname in range(NUM_CLASSES)}  # Klassenweise
 total_per_class = {classname: 0 for classname in range(NUM_CLASSES)}  # Pixelanzahl pro Klasse
 
+# Collect all predictions and images
+all_imgs = []
+all_labels = []
+all_preds = []
+
 with torch.no_grad():
     for imgs, labels in val_loader:
         imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-
-        # Modellvorhersagen
         outputs = model(imgs)
         preds = torch.argmax(outputs, dim=1)
 
-        # Pixelgenauigkeit berechnen
-        correct_pixels += (preds == labels).sum().item()
-        total_pixels += torch.numel(labels)
+        # Store batch data
+        all_imgs.extend(imgs.cpu())
+        all_labels.extend(labels.cpu())
+        all_preds.extend(preds.cpu())
 
-        # Klassenweise Genauigkeit berechnen
-        for label, prediction in zip(labels.view(-1), preds.view(-1)):  # Pixelweise
-            total_per_class[label.item()] += 1
-            if label == prediction:
-                correct_per_class[label.item()] += 1
+# Create interactive plot
+current_idx = [0]  # Using list to allow modification in button callback
 
-        # Beispielvisualisierung (optional)
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 3, 1)
-        plt.title("Input")
-        plt.imshow(imgs[4].cpu().permute(1, 2, 0))  # RGB-Darstellung
-        plt.subplot(1, 3, 2)
-        plt.title("Label")
-        plt.imshow(labels[4].cpu(), cmap='gray')  # Ground Truth
-        plt.subplot(1, 3, 3)
-        plt.title("Prediction")
-        plt.imshow(preds[4].cpu(), cmap='gray')  # Modellvorhersage
-        plt.show()
-        break  # Nur die erste Batch visualisieren
+fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+plt.subplots_adjust(bottom=0.2)  # Make room for buttons
 
-# Gesamtaccuracy berechnen
-overall_accuracy = 100 * correct_pixels / total_pixels
-print(f'Overall Pixel Accuracy: {overall_accuracy:.2f} %')
 
-# Klassenweise Genauigkeit berechnen
-for classname, correct_count in correct_per_class.items():
-    if total_per_class[classname] > 0:  # Vermeidung von Division durch 0
-        class_accuracy = 100 * float(correct_count) / total_per_class[classname]
-        print(f'Accuracy for class {classname} is {class_accuracy:.1f} %')
+def update_plot(idx):
+    for ax in axs:
+        ax.clear()
+
+    axs[0].imshow(all_imgs[idx].permute(1, 2, 0))
+    axs[0].set_title("Input")
+    axs[1].imshow(all_labels[idx], cmap='gray')
+    axs[1].set_title("Label")
+    axs[2].imshow(all_preds[idx], cmap='gray')
+    axs[2].set_title("Prediction")
+    plt.draw()
+
+
+def on_prev_button(event):
+    current_idx[0] = (current_idx[0] - 1) % len(all_imgs)
+    update_plot(current_idx[0])
+
+
+def on_next_button(event):
+    current_idx[0] = (current_idx[0] + 1) % len(all_imgs)
+    update_plot(current_idx[0])
+
+
+# Add buttons
+ax_prev = plt.axes([0.3, 0.05, 0.1, 0.075])
+ax_next = plt.axes([0.6, 0.05, 0.1, 0.075])
+btn_prev = plt.Button(ax_prev, 'Previous')
+btn_next = plt.Button(ax_next, 'Next')
+
+btn_prev.on_clicked(on_prev_button)
+btn_next.on_clicked(on_next_button)
+
+# Show initial plot
+update_plot(0)
+plt.show()
+
